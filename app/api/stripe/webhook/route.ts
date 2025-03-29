@@ -115,8 +115,8 @@ export const POST = withCors(async function POST(request: NextRequest) {
       event = stripe.webhooks.constructEvent(body, sig, webhookSecret);
       logWebhookEvent(`Event received: ${event.type}`, { 
         eventType: event.type,
-        objectId: (event.data.object as any).id,
-        objectType: (event.data.object as any).object 
+        objectId: typeof event.data.object === 'object' && 'id' in event.data.object ? event.data.object.id : undefined,
+        objectType: typeof event.data.object === 'object' && 'object' in event.data.object ? event.data.object.object : undefined
       });
     } catch (err) {
       const error = err as Error;
