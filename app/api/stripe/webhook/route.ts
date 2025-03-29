@@ -93,26 +93,6 @@ export const POST = withCors(async function POST(request: NextRequest) {
       case 'checkout.session.completed': {
         const session = event.data.object as Stripe.Checkout.Session;
         
-        // Check for existing active subscription
-        const hasActiveSubscription = await checkExistingSubscription(session.customer as string);
-        
-        if (hasActiveSubscription) {
-          logWebhookEvent('Duplicate subscription attempt blocked', {
-            customerId: session.customer,
-            sessionId: session.id
-          });
-          
-          // Cancel the new subscription immediately
-          if (session.subscription) {
-            await stripe.subscriptions.cancel(session.subscription as string);
-          }
-          
-          return NextResponse.json({ 
-            status: 'blocked',
-            message: 'Customer already has an active subscription'
-          });
-        }
-
         logWebhookEvent('Processing checkout.session.completed', {
           sessionId: session.id,
           clientReferenceId: session.client_reference_id,
@@ -120,25 +100,54 @@ export const POST = withCors(async function POST(request: NextRequest) {
           subscriptionId: session.subscription
         });
 
-        if (!session.client_reference_id || !session.customer || !session.subscription) {
-          logWebhookEvent('Missing required session data', {
-            clientReferenceId: session.client_reference_id,
-            customerId: session.customer,
-            subscriptionId: session.subscription
-          });
-          return NextResponse.json({ error: 'Invalid session data' }, { status: 400 });
+        // Guard against missing data
+        if (!session.client_reference_id) {
+          logWebhookEvent('Missing client_reference_id in session', session);
+          return NextResponse.json({ error: 'Missing client_reference_id' }, { status: 400 });
         }
 
+        if (!session.customer) {
+          logWebhookEvent('Missing customer in session', session);
+          return NextResponse.json({ error: 'Missing customer ID' }, { status: 400 });
+        }
+
+        if (!session.subscription) {
+          logWebhookEvent('Missing subscription in session', session);
+          return NextResponse.json({ error: 'Missing subscription ID' }, { status: 400 });
+        }
+
+        // Check for existing active subscription
         try {
+          const hasActiveSubscription = await checkExistingSubscription(session.customer as string);
+          
+          if (hasActiveSubscription) {
+            logWebhookEvent('Duplicate subscription attempt blocked', {
+              customerId: session.customer,
+              sessionId: session.id
+            });
+            
+            // Cancel the new subscription immediately
+            if (session.subscription) {
+              await stripe.subscriptions.cancel(session.subscription as string);
+              logWebhookEvent('Cancelled duplicate subscription', { subscriptionId: session.subscription });
+            }
+            
+            return NextResponse.json({ 
+              status: 'blocked',
+              message: 'Customer already has an active subscription'
+            });
+          }
+
           const subscription = await createSubscription(
             session.subscription as string,
-            session.client_reference_id!,
+            session.client_reference_id,
             session.customer as string
           );
           logWebhookEvent('Successfully created subscription', subscription);
         } catch (error) {
-          logWebhookEvent('Failed to create subscription', error);
-          throw error;
+          logWebhookEvent('Failed to process checkout.session.completed', error);
+          // Don't throw here, just log the error and return success to avoid webhook retries
+          return NextResponse.json({ received: true, warning: 'Error processing checkout session' });
         }
         break;
       }
@@ -167,7 +176,6 @@ export const POST = withCors(async function POST(request: NextRequest) {
       }
 
       case 'customer.subscription.updated':
-      case 'customer.subscription.deleted':
       case 'customer.subscription.pending_update_applied':
       case 'customer.subscription.pending_update_expired':
       case 'customer.subscription.trial_will_end': {
@@ -221,9 +229,10 @@ export const POST = withCors(async function POST(request: NextRequest) {
 
     return NextResponse.json({ received: true });
   } catch (err) {
-    logWebhookEvent('Webhook error', err);
+    const error = err as Error;
+    logWebhookEvent('Webhook error', error);
     return NextResponse.json(
-      { error: 'Webhook handler failed' },
+      { error: 'Webhook handler failed', message: error.message },
       { status: 400 }
     );
   }
@@ -242,8 +251,9 @@ async function createSubscription(subscriptionId: string, userId: string, custom
       .eq('stripe_subscription_id', subscriptionId)
       .single();
 
-    if (checkError) {
+    if (checkError && checkError.code !== 'PGRST116') {  // PGRST116 is "no rows returned"
       logWebhookEvent('Error checking existing subscription', checkError);
+      throw checkError;
     }
 
     if (existingData) {
