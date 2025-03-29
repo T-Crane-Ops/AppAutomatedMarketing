@@ -36,12 +36,16 @@ export const config = {
 };
 
 async function checkExistingSubscription(customerId: string): Promise<boolean> {
-  const { data: existingSubs } = await supabaseAdmin
+  const { data: existingSubs, error } = await supabaseAdmin
     .from('subscriptions')
     .select('*')
     .eq('stripe_customer_id', customerId)
     .in('status', ['active', 'trialing'])
     .single();
+
+  if (error) {
+    logWebhookEvent('Error checking existing subscription', { customerId, error });
+  }
 
   return !!existingSubs;
 }
@@ -51,19 +55,32 @@ async function findUserIdByEmail(email: string): Promise<string | null> {
   logWebhookEvent('Looking up user by email', { email });
   
   try {
-    const { data, error } = await supabaseAdmin
-      .from('users')
-      .select('id')
-      .ilike('email', email)
-      .single();
+    // Use raw SQL query to bypass RLS policies for admin operations
+    const { data, error } = await supabaseAdmin.rpc('find_user_by_email', {
+      user_email: email
+    });
     
     if (error || !data) {
-      logWebhookEvent('No user found with email', { email, error });
-      return null;
+      logWebhookEvent('Error in RPC call find_user_by_email', { email, error });
+      
+      // Fallback to direct query
+      const { data: userData, error: userError } = await supabaseAdmin
+        .from('users')
+        .select('id')
+        .ilike('email', email)
+        .single();
+      
+      if (userError || !userData) {
+        logWebhookEvent('No user found with email (direct query)', { email, error: userError });
+        return null;
+      }
+      
+      logWebhookEvent('Found user by email (direct query)', { email, userId: userData.id });
+      return userData.id;
     }
     
-    logWebhookEvent('Found user by email', { email, userId: data.id });
-    return data.id;
+    logWebhookEvent('Found user by email (RPC)', { email, userId: data });
+    return data;
   } catch (error) {
     logWebhookEvent('Error looking up user by email', { email, error });
     return null;
@@ -169,12 +186,19 @@ export const POST = withCors(async function POST(request: NextRequest) {
               logWebhookEvent('No user found with this email', { email });
               
               // Attempt to get all users for debugging
-              const { data: allUsers } = await supabaseAdmin
-                .from('users')
-                .select('id, email')
-                .limit(10);
+              try {
+                // Use raw SQL to bypass RLS
+                const { data: allUsers, error } = await supabaseAdmin.rpc('get_first_ten_users');
+                
+                if (error) {
+                  logWebhookEvent('Error fetching users for debugging', { error });
+                } else {
+                  logWebhookEvent('First 10 users in database for debugging', { users: allUsers });
+                }
+              } catch (e) {
+                logWebhookEvent('Exception when trying to get users for debugging', e);
+              }
               
-              logWebhookEvent('First 10 users in database for debugging', { users: allUsers });
               return NextResponse.json({ error: 'User not found' }, { status: 400 });
             }
           } else {
@@ -185,30 +209,40 @@ export const POST = withCors(async function POST(request: NextRequest) {
 
         // Validate the userId exists in the database
         try {
-          const { data: userExists } = await supabaseAdmin
-            .from('users')
-            .select('id')
-            .eq('id', userId)
-            .single();
+          // Use RPC to bypass RLS
+          const { data: userExists, error } = await supabaseAdmin.rpc('check_user_exists', {
+            user_id: userId
+          });
           
-          if (!userExists) {
-            logWebhookEvent('User ID not found in database', { userId });
+          if (error || !userExists) {
+            logWebhookEvent('User ID not found in database via RPC', { userId, error });
             
-            // If user ID not found, try one more time to find by email
-            const email = session.customer_details?.email || session.customer_email;
-            if (email) {
-              const foundUserId = await findUserIdByEmail(email);
-              if (foundUserId) {
-                userId = foundUserId;
-                logWebhookEvent('Found alternative user ID by email', { email, userId });
+            // Fallback to direct query
+            const { data: directUserCheck } = await supabaseAdmin
+              .from('users')
+              .select('id')
+              .eq('id', userId)
+              .single();
+              
+            if (!directUserCheck) {
+              // If user ID not found, try one more time to find by email
+              const email = session.customer_details?.email || session.customer_email;
+              if (email) {
+                const foundUserId = await findUserIdByEmail(email);
+                if (foundUserId) {
+                  userId = foundUserId;
+                  logWebhookEvent('Found alternative user ID by email', { email, userId });
+                } else {
+                  return NextResponse.json({ error: 'User ID not valid' }, { status: 400 });
+                }
               } else {
-                return NextResponse.json({ error: 'User ID not valid' }, { status: 400 });
+                return NextResponse.json({ error: 'User ID not valid and no email to retry' }, { status: 400 });
               }
             } else {
-              return NextResponse.json({ error: 'User ID not valid and no email to retry' }, { status: 400 });
+              logWebhookEvent('Confirmed user ID exists via direct query', { userId });
             }
           } else {
-            logWebhookEvent('Confirmed user ID exists in database', { userId });
+            logWebhookEvent('Confirmed user ID exists via RPC', { userId });
           }
         } catch (error) {
           logWebhookEvent('Error validating user ID', { userId, error });
@@ -381,15 +415,26 @@ async function createSubscription(subscriptionId: string, userId: string, custom
     }
 
     // Check if userId exists in the users table
-    const { data: userExists, error: userError } = await supabaseAdmin
-      .from('users')
-      .select('id')
-      .eq('id', userId)
-      .single();
+    const { data: userExists, error: userError } = await supabaseAdmin.rpc('check_user_exists', {
+      user_id: userId
+    });
 
     if (userError || !userExists) {
-      logWebhookEvent('User ID not found in database', { userId, error: userError });
-      throw new Error(`User ID ${userId} not found in database`);
+      // Fallback to direct check
+      const { data: directCheck, error: directError } = await supabaseAdmin
+        .from('users')
+        .select('id')
+        .eq('id', userId)
+        .single();
+        
+      if (directError || !directCheck) {
+        logWebhookEvent('User ID not found in database', { userId, error: directError || userError });
+        throw new Error(`User ID ${userId} not found in database`);
+      }
+      
+      logWebhookEvent('User found via direct check', { userId });
+    } else {
+      logWebhookEvent('User found via RPC', { userId });
     }
 
     const stripeSubscription = await stripe.subscriptions.retrieve(subscriptionId);
