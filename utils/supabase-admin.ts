@@ -17,6 +17,14 @@ export const supabaseAdmin = createClient(
       autoRefreshToken: false,
       persistSession: false,
       detectSessionInUrl: false
+    },
+    db: {
+      schema: 'public'
+    },
+    global: {
+      headers: {
+        'x-supabase-role': 'service_role'
+      }
     }
   }
 );
