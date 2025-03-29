@@ -110,8 +110,19 @@ export const POST = withCors(async function POST(request: NextRequest) {
     logWebhookEvent('Received webhook request');
     logWebhookEvent('Stripe signature', sig);
 
-    const event = stripe.webhooks.constructEvent(body, sig, webhookSecret);
-    logWebhookEvent(`Event received: ${event.type}`, event.data.object);
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(body, sig, webhookSecret);
+      logWebhookEvent(`Event received: ${event.type}`, { 
+        eventType: event.type,
+        objectId: (event.data.object as any).id,
+        objectType: (event.data.object as any).object 
+      });
+    } catch (err) {
+      const error = err as Error;
+      logWebhookEvent('Error constructing Stripe event', { error: error.message, sig });
+      return NextResponse.json({ error: 'Webhook signature verification failed' }, { status: 400 });
+    }
 
     switch (event.type) {
       case 'checkout.session.completed': {
@@ -122,7 +133,8 @@ export const POST = withCors(async function POST(request: NextRequest) {
           clientReferenceId: session.client_reference_id,
           customerId: session.customer,
           subscriptionId: session.subscription,
-          customerEmail: session.customer_details?.email || session.customer_email
+          customerEmail: session.customer_details?.email || session.customer_email,
+          paymentStatus: session.payment_status
         });
 
         // Required fields validation
@@ -154,12 +166,51 @@ export const POST = withCors(async function POST(request: NextRequest) {
               logWebhookEvent('Found user ID by email', { email, userId });
             } else {
               logWebhookEvent('No user found with this email', { email });
+              
+              // Attempt to get all users for debugging
+              const { data: allUsers } = await supabaseAdmin
+                .from('users')
+                .select('id, email')
+                .limit(10);
+              
+              logWebhookEvent('First 10 users in database for debugging', { users: allUsers });
               return NextResponse.json({ error: 'User not found' }, { status: 400 });
             }
           } else {
             logWebhookEvent('No email available to look up user', session);
             return NextResponse.json({ error: 'No email to identify user' }, { status: 400 });
           }
+        }
+
+        // Validate the userId exists in the database
+        try {
+          const { data: userExists } = await supabaseAdmin
+            .from('users')
+            .select('id')
+            .eq('id', userId)
+            .single();
+          
+          if (!userExists) {
+            logWebhookEvent('User ID not found in database', { userId });
+            
+            // If user ID not found, try one more time to find by email
+            const email = session.customer_details?.email || session.customer_email;
+            if (email) {
+              const foundUserId = await findUserIdByEmail(email);
+              if (foundUserId) {
+                userId = foundUserId;
+                logWebhookEvent('Found alternative user ID by email', { email, userId });
+              } else {
+                return NextResponse.json({ error: 'User ID not valid' }, { status: 400 });
+              }
+            } else {
+              return NextResponse.json({ error: 'User ID not valid and no email to retry' }, { status: 400 });
+            }
+          } else {
+            logWebhookEvent('Confirmed user ID exists in database', { userId });
+          }
+        } catch (error) {
+          logWebhookEvent('Error validating user ID', { userId, error });
         }
 
         // Check for existing active subscription
@@ -184,12 +235,39 @@ export const POST = withCors(async function POST(request: NextRequest) {
             });
           }
 
-          const subscription = await createSubscription(
-            session.subscription as string,
+          logWebhookEvent('Creating subscription record', {
             userId,
-            session.customer as string
-          );
-          logWebhookEvent('Successfully created subscription', subscription);
+            customerId: session.customer as string,
+            subscriptionId: session.subscription as string
+          });
+
+          try {
+            const subscription = await createSubscription(
+              session.subscription as string,
+              userId,
+              session.customer as string
+            );
+            logWebhookEvent('Successfully created subscription', subscription);
+          } catch (subError) {
+            logWebhookEvent('Failed to create subscription', subError);
+            
+            // Try to get more information about what went wrong
+            try {
+              const stripeSubscription = await stripe.subscriptions.retrieve(session.subscription as string);
+              logWebhookEvent('Subscription info from Stripe', { 
+                status: stripeSubscription.status,
+                customer: stripeSubscription.customer,
+                items: stripeSubscription.items.data.map(item => ({ 
+                  price: item.price.id,
+                  quantity: item.quantity
+                }))
+              });
+            } catch (retrieveError) {
+              logWebhookEvent('Failed to retrieve subscription from Stripe', retrieveError);
+            }
+            
+            throw subError;
+          }
         } catch (error) {
           logWebhookEvent('Failed to process checkout.session.completed', error);
           // Don't throw here, just log the error and return success to avoid webhook retries
@@ -288,6 +366,31 @@ async function createSubscription(subscriptionId: string, userId: string, custom
   logWebhookEvent('Starting createSubscription', { subscriptionId, userId, customerId });
 
   try {
+    // Validate inputs
+    if (!subscriptionId || !userId || !customerId) {
+      logWebhookEvent('Missing required parameters for createSubscription', { 
+        subscriptionId, 
+        userId, 
+        customerId,
+        hasSubscriptionId: !!subscriptionId,
+        hasUserId: !!userId,
+        hasCustomerId: !!customerId 
+      });
+      throw new Error('Missing required parameters for createSubscription');
+    }
+
+    // Check if userId exists in the users table
+    const { data: userExists, error: userError } = await supabaseAdmin
+      .from('users')
+      .select('id')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !userExists) {
+      logWebhookEvent('User ID not found in database', { userId, error: userError });
+      throw new Error(`User ID ${userId} not found in database`);
+    }
+
     const stripeSubscription = await stripe.subscriptions.retrieve(subscriptionId);
     logWebhookEvent('Retrieved Stripe subscription', stripeSubscription);
 
@@ -312,9 +415,7 @@ async function createSubscription(subscriptionId: string, userId: string, custom
           cancel_at_period_end: stripeSubscription.cancel_at_period_end,
           updated_at: new Date().toISOString()
         })
-        .eq('stripe_subscription_id', subscriptionId)
-        .select()
-        .single();
+        .eq('stripe_subscription_id', subscriptionId);
 
       if (updateError) {
         logWebhookEvent('Error updating existing subscription', updateError);
@@ -323,30 +424,45 @@ async function createSubscription(subscriptionId: string, userId: string, custom
       return existingData;
     }
 
-    logWebhookEvent('Creating new subscription record');
+    // Create a new subscription - ensure valid data for all required fields
+    const newSubscription = {
+      user_id: userId,
+      stripe_customer_id: customerId,
+      stripe_subscription_id: subscriptionId,
+      status: stripeSubscription.status,
+      price_id: stripeSubscription.items.data[0]?.price.id || 'unknown',
+      current_period_end: new Date(stripeSubscription.current_period_end * 1000).toISOString(),
+      cancel_at_period_end: stripeSubscription.cancel_at_period_end,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    
+    logWebhookEvent('Creating new subscription record with data', newSubscription);
+    
     const { data, error: insertError } = await supabaseAdmin
       .from('subscriptions')
-      .insert({
-        user_id: userId,
-        stripe_customer_id: customerId,
-        stripe_subscription_id: subscriptionId,
-        status: stripeSubscription.status,
-        price_id: stripeSubscription.items.data[0]?.price.id,
-        current_period_end: new Date(stripeSubscription.current_period_end * 1000).toISOString(),
-        cancel_at_period_end: stripeSubscription.cancel_at_period_end,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
-      .select()
-      .single();
+      .insert(newSubscription);
 
     if (insertError) {
       logWebhookEvent('Error inserting new subscription', insertError);
       throw insertError;
     }
 
+    // Verify the subscription was created
+    const { data: verifyData, error: verifyError } = await supabaseAdmin
+      .from('subscriptions')
+      .select('*')
+      .eq('stripe_subscription_id', subscriptionId)
+      .single();
+      
+    if (verifyError || !verifyData) {
+      logWebhookEvent('Failed to verify subscription creation', { verifyError });
+    } else {
+      logWebhookEvent('Successfully verified subscription creation', verifyData);
+    }
+
     logWebhookEvent('Successfully created new subscription', data);
-    return data;
+    return data || verifyData;
   } catch (error) {
     logWebhookEvent('Error in createSubscription', error);
     throw error;
