@@ -46,6 +46,30 @@ async function checkExistingSubscription(customerId: string): Promise<boolean> {
   return !!existingSubs;
 }
 
+// Helper function to find user ID by email
+async function findUserIdByEmail(email: string): Promise<string | null> {
+  logWebhookEvent('Looking up user by email', { email });
+  
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('users')
+      .select('id')
+      .ilike('email', email)
+      .single();
+    
+    if (error || !data) {
+      logWebhookEvent('No user found with email', { email, error });
+      return null;
+    }
+    
+    logWebhookEvent('Found user by email', { email, userId: data.id });
+    return data.id;
+  } catch (error) {
+    logWebhookEvent('Error looking up user by email', { email, error });
+    return null;
+  }
+}
+
 // Currently Handled Events:
 // 1. checkout.session.completed - When a customer completes checkout
 // 2. customer.subscription.created - When a new subscription is created
@@ -97,13 +121,14 @@ export const POST = withCors(async function POST(request: NextRequest) {
           sessionId: session.id,
           clientReferenceId: session.client_reference_id,
           customerId: session.customer,
-          subscriptionId: session.subscription
+          subscriptionId: session.subscription,
+          customerEmail: session.customer_details?.email || session.customer_email
         });
 
-        // Guard against missing data
-        if (!session.client_reference_id) {
-          logWebhookEvent('Missing client_reference_id in session', session);
-          return NextResponse.json({ error: 'Missing client_reference_id' }, { status: 400 });
+        // Required fields validation
+        if (!session.subscription) {
+          logWebhookEvent('Missing subscription in session', session);
+          return NextResponse.json({ error: 'Missing subscription ID' }, { status: 400 });
         }
 
         if (!session.customer) {
@@ -111,9 +136,30 @@ export const POST = withCors(async function POST(request: NextRequest) {
           return NextResponse.json({ error: 'Missing customer ID' }, { status: 400 });
         }
 
-        if (!session.subscription) {
-          logWebhookEvent('Missing subscription in session', session);
-          return NextResponse.json({ error: 'Missing subscription ID' }, { status: 400 });
+        // Try to find user ID - first from client_reference_id, then from email
+        let userId = session.client_reference_id || '';
+        
+        // If there's no client_reference_id or it doesn't look like a valid UUID, try to look up by email
+        if (!userId || !userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
+          logWebhookEvent('Invalid or missing client_reference_id, trying to find user by email', { 
+            clientReferenceId: userId,
+            customerEmail: session.customer_details?.email || session.customer_email 
+          });
+          
+          const email = session.customer_details?.email || session.customer_email;
+          if (email) {
+            const foundUserId = await findUserIdByEmail(email);
+            if (foundUserId) {
+              userId = foundUserId;
+              logWebhookEvent('Found user ID by email', { email, userId });
+            } else {
+              logWebhookEvent('No user found with this email', { email });
+              return NextResponse.json({ error: 'User not found' }, { status: 400 });
+            }
+          } else {
+            logWebhookEvent('No email available to look up user', session);
+            return NextResponse.json({ error: 'No email to identify user' }, { status: 400 });
+          }
         }
 
         // Check for existing active subscription
@@ -140,7 +186,7 @@ export const POST = withCors(async function POST(request: NextRequest) {
 
           const subscription = await createSubscription(
             session.subscription as string,
-            session.client_reference_id,
+            userId,
             session.customer as string
           );
           logWebhookEvent('Successfully created subscription', subscription);
